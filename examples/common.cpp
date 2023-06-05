@@ -251,6 +251,12 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.model = argv[i];
+        } else if (arg == "-a" || arg == "--alias") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.model_alias = argv[i];
         } else if (arg == "--lora") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -283,11 +289,18 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 invalid_param = true;
                 break;
             }
+#ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
             params.n_gpu_layers = std::stoi(argv[i]);
+#else
+            fprintf(stderr, "warning: not compiled with GPU offload support, --n-gpu-layers option will be ignored\n");
+            fprintf(stderr, "warning: see main README.md for information on enabling GPU BLAS support\n");
+#endif
         } else if (arg == "--no-mmap") {
             params.use_mmap = false;
         } else if (arg == "--mtest") {
             params.mem_test = true;
+        } else if (arg == "--export") {
+            params.export_cgraph = true;
         } else if (arg == "--verbose-prompt") {
             params.verbose_prompt = true;
         } else if (arg == "-r" || arg == "--reverse-prompt") {
@@ -351,7 +364,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
     }
     if (params.prompt_cache_all &&
             (params.interactive || params.interactive_first ||
-             params.instruct || params.antiprompt.size())) {
+             params.instruct)) {
         fprintf(stderr, "error: --prompt-cache-all not supported in interactive mode yet\n");
         gpt_print_usage(argc, argv, default_params);
         exit(1);
@@ -373,8 +386,8 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  -ins, --instruct      run in instruction mode (use with Alpaca models)\n");
     fprintf(stderr, "  --multiline-input     allows you to write or paste multiple lines without ending each in '\\'\n");
     fprintf(stderr, "  -r PROMPT, --reverse-prompt PROMPT\n");
-    fprintf(stderr, "                        run in interactive mode and poll user input upon seeing PROMPT (can be\n");
-    fprintf(stderr, "                        specified more than once for multiple prompts).\n");
+    fprintf(stderr, "                        halt generation at PROMPT, return control in interactive mode\n");
+    fprintf(stderr, "                        (can be specified more than once for multiple prompts).\n");
     fprintf(stderr, "  --color               colorise output to distinguish prompt and user input from generations\n");
     fprintf(stderr, "  -s SEED, --seed SEED  RNG seed (default: -1, use random seed for < 0)\n");
     fprintf(stderr, "  -t N, --threads N     number of threads to use during computation (default: %d)\n", params.n_threads);
@@ -410,7 +423,8 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  -c N, --ctx-size N    size of the prompt context (default: %d)\n", params.n_ctx);
     fprintf(stderr, "  --ignore-eos          ignore end of stream token and continue generating (implies --logit-bias 2-inf)\n");
     fprintf(stderr, "  --no-penalize-nl      do not penalize newline token\n");
-    fprintf(stderr, "  --memory-f32          use f32 instead of f16 for memory key+value\n");
+    fprintf(stderr, "  --memory-f32          use f32 instead of f16 for memory key+value (default: disabled)\n");
+    fprintf(stderr, "                        not recommended: doubles context memory required and no measurable increase in quality\n");
     fprintf(stderr, "  --temp N              temperature (default: %.1f)\n", (double)params.temp);
     fprintf(stderr, "  -b N, --batch-size N  batch size for prompt processing (default: %d)\n", params.n_batch);
     fprintf(stderr, "  --perplexity          compute perplexity over the prompt\n");
@@ -421,9 +435,12 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     if (llama_mmap_supported()) {
         fprintf(stderr, "  --no-mmap             do not memory-map model (slower load but may reduce pageouts if not using mlock)\n");
     }
+#ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
     fprintf(stderr, "  -ngl N, --n-gpu-layers N\n");
     fprintf(stderr, "                        number of layers to store in VRAM\n");
+#endif
     fprintf(stderr, "  --mtest               compute maximum memory usage\n");
+    fprintf(stderr, "  --export              export the computation graph to 'llama.ggml'\n");
     fprintf(stderr, "  --verbose-prompt      print prompt before generation\n");
     fprintf(stderr, "  --lora FNAME          apply LoRA adapter (implies --no-mmap)\n");
     fprintf(stderr, "  --lora-base FNAME     optional model to use as a base for the layers modified by the LoRA adapter\n");
@@ -578,6 +595,37 @@ void console_set_color(console_state & con_st, console_color_t color) {
 }
 
 char32_t getchar32() {
+#if defined(_WIN32)
+    HANDLE hConsole = GetStdHandle(STD_INPUT_HANDLE);
+    wchar_t high_surrogate = 0;
+
+    while (true) {
+        INPUT_RECORD record;
+        DWORD count;
+        if (!ReadConsoleInputW(hConsole, &record, 1, &count) || count == 0) {
+            return WEOF;
+        }
+
+        if (record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown) {
+            wchar_t wc = record.Event.KeyEvent.uChar.UnicodeChar;
+            if (wc == 0) {
+                continue;
+            }
+
+            if ((wc >= 0xD800) && (wc <= 0xDBFF)) { // Check if wc is a high surrogate
+                high_surrogate = wc;
+                continue;
+            } else if ((wc >= 0xDC00) && (wc <= 0xDFFF)) { // Check if wc is a low surrogate
+                if (high_surrogate != 0) { // Check if we have a high surrogate
+                    return ((high_surrogate - 0xD800) << 10) + (wc - 0xDC00) + 0x10000;
+                }
+            }
+
+            high_surrogate = 0; // Reset the high surrogate
+            return static_cast<char32_t>(wc);
+        }
+    }
+#else
     wchar_t wc = getwchar();
     if (static_cast<wint_t>(wc) == WEOF) {
         return WEOF;
@@ -596,6 +644,7 @@ char32_t getchar32() {
 #endif
 
     return static_cast<char32_t>(wc);
+#endif
 }
 
 void pop_cursor(console_state & con_st) {
@@ -749,7 +798,7 @@ bool console_readline(console_state & con_st, std::string & line) {
             break;
         }
 
-        if (input_char == WEOF || input_char == 0x04 /* Ctrl+D*/) {
+        if (input_char == (char32_t) WEOF || input_char == 0x04 /* Ctrl+D*/) {
             end_of_stream = true;
             break;
         }
@@ -764,7 +813,7 @@ bool console_readline(console_state & con_st, std::string & line) {
             char32_t code = getchar32();
             if (code == '[' || code == 0x1B) {
                 // Discard the rest of the escape sequence
-                while ((code = getchar32()) != WEOF) {
+                while ((code = getchar32()) != (char32_t) WEOF) {
                     if ((code >= 'A' && code <= 'Z') || (code >= 'a' && code <= 'z') || code == '~') {
                         break;
                     }
