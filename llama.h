@@ -1,6 +1,13 @@
 #ifndef LLAMA_H
 #define LLAMA_H
 
+#include "ggml.h"
+#ifdef GGML_USE_CUBLAS
+#include "ggml-cuda.h"
+#define LLAMA_MAX_DEVICES GGML_CUDA_MAX_DEVICES
+#else
+#define LLAMA_MAX_DEVICES 1
+#endif // GGML_USE_CUBLAS
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -64,24 +71,27 @@ extern "C" {
 
     typedef void (*llama_progress_callback)(float progress, void *ctx);
 
-    struct llama_context_params {
-        int n_ctx;        // text context
-        int n_gpu_layers; // number of layers to store in VRAM
-        int seed;         // RNG seed, -1 for random
+   struct llama_context_params {
+        int seed;                              // RNG seed, -1 for random
+        int n_ctx;                             // text context
+        int n_batch;                           // prompt processing batch size
+        int n_gpu_layers;                      // number of layers to store in VRAM
+        int main_gpu;                          // the GPU that is used for scratch and small tensors
+        float tensor_split[LLAMA_MAX_DEVICES]; // how to split layers across multiple GPUs
+        // called with a progress value between 0 and 1, pass NULL to disable
+        llama_progress_callback progress_callback;
+        // context pointer passed to the progress callback
+        void * progress_callback_user_data;
 
+        // Keep the booleans together to avoid misalignment during copy-by-value.
+        bool low_vram;   // if true, reduce VRAM usage at the cost of performance
         bool f16_kv;     // use fp16 for KV cache
         bool logits_all; // the llama_eval() call computes all logits, not just the last one
         bool vocab_only; // only load the vocabulary, no weights
         bool use_mmap;   // use mmap if possible
         bool use_mlock;  // force system to keep model in RAM
         bool embedding;  // embedding mode only
-
-        // called with a progress value between 0 and 1, pass NULL to disable
-        llama_progress_callback progress_callback;
-        // context pointer passed to the progress callback
-        void * progress_callback_user_data;
     };
-
     // model file types
     enum llama_ftype {
         LLAMA_FTYPE_ALL_F32              = 0,
@@ -105,7 +115,16 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q6_K          = 18,// except 1d tensors
     };
 
+    // model quantization parameters
+    typedef struct llama_model_quantize_params {
+        int nthread;                 // number of threads to use for quantizing, if <=0 will use std::thread::hardware_concurrency()
+        enum llama_ftype   ftype;    // quantize to this llama_ftype
+        bool allow_requantize;       // allow quantizing non-f32/f16 tensors
+        bool quantize_output_tensor; // quantize output.weight
+    } llama_model_quantize_params;
+
     LLAMA_API struct llama_context_params llama_context_default_params();
+    LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params();
 
     LLAMA_API bool llama_mmap_supported();
     LLAMA_API bool llama_mlock_supported();
@@ -127,14 +146,11 @@ extern "C" {
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
 
-    // TODO: not great API - very likely to change
     // Returns 0 on success
-    // nthread - how many threads to use. If <=0, will use std::thread::hardware_concurrency(), else the number given
     LLAMA_API int llama_model_quantize(
             const char * fname_inp,
             const char * fname_out,
-      enum llama_ftype   ftype,
-            int          nthread);
+            const llama_model_quantize_params * params);
 
     // Apply a LoRA adapter to a loaded model
     // path_base_model is the path to a higher quality model to use as a base for
@@ -204,6 +220,14 @@ extern "C" {
     LLAMA_API int llama_n_ctx  (const struct llama_context * ctx);
     LLAMA_API int llama_n_embd (const struct llama_context * ctx);
 
+    // Get the vocabulary as output parameters.
+    // Returns number of results.
+    LLAMA_API int llama_get_vocab(
+            const struct llama_context * ctx,
+                          const char * * strings,
+                                 float * scores,
+                                   int   capacity);
+
     // Token logits obtained from the last call to llama_eval()
     // The logits for the last token are stored in the last row
     // Can be mutated in order to change the probabilities of the next token
@@ -219,9 +243,9 @@ extern "C" {
     LLAMA_API const char * llama_token_to_str(const struct llama_context * ctx, llama_token token);
 
     // Special tokens
-    LLAMA_API llama_token llama_token_bos();
-    LLAMA_API llama_token llama_token_eos();
-    LLAMA_API llama_token llama_token_nl();
+    LLAMA_API llama_token llama_token_bos();  // beginning-of-sentence
+    LLAMA_API llama_token llama_token_eos();  // end-of-sentence
+    LLAMA_API llama_token llama_token_nl();   // next-line
 
     // Sampling functions
 

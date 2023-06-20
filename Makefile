@@ -1,8 +1,10 @@
 # Define the default target now so that it is always the first target
-BUILD_TARGETS = main quantize quantize-stats perplexity embedding vdot
+BUILD_TARGETS = main quantize quantize-stats perplexity embedding vdot train-text-from-scratch simple
 
 ifdef LLAMA_BUILD_SERVER
 	BUILD_TARGETS += server
+	LLAMA_SERVER_VERBOSE ?= 1
+server: private CXXFLAGS += -DSERVER_VERBOSE=$(LLAMA_SERVER_VERBOSE)
 endif
 
 default: $(BUILD_TARGETS)
@@ -107,6 +109,10 @@ ifeq ($(UNAME_M),$(filter $(UNAME_M),x86_64 i686))
 	# Usage AVX-only
 	#CFLAGS   += -mfma -mf16c -mavx
 	#CXXFLAGS += -mfma -mf16c -mavx
+
+	# Usage SSSE3-only (Not is SSE3!)
+	#CFLAGS   += -mssse3
+	#CXXFLAGS += -mssse3
 endif
 
 ifneq ($(filter ppc64%,$(UNAME_M)),)
@@ -121,6 +127,12 @@ ifneq ($(filter ppc64%,$(UNAME_M)),)
 	endif
 endif
 
+ifndef LLAMA_NO_K_QUANTS
+	CFLAGS   += -DGGML_USE_K_QUANTS
+	CXXFLAGS += -DGGML_USE_K_QUANTS
+	OBJS     += k_quants.o
+endif
+
 ifndef LLAMA_NO_ACCELERATE
 	# Mac M1 - include Accelerate framework.
 	# `-framework Accelerate` works on Mac Intel as well, with negliable performance boost (as of the predict time).
@@ -132,15 +144,11 @@ endif # LLAMA_NO_ACCELERATE
 
 ifdef LLAMA_OPENBLAS
 	CFLAGS  += -DGGML_USE_OPENBLAS -I/usr/local/include/openblas -I/usr/include/openblas
-	ifneq ($(shell grep -e "Arch Linux" -e "ID_LIKE=arch" /etc/os-release 2>/dev/null),)
-		LDFLAGS += -lopenblas -lcblas
-	else
-		LDFLAGS += -lopenblas
-	endif
+	LDFLAGS += -lopenblas
 endif # LLAMA_OPENBLAS
 
 ifdef LLAMA_BLIS
-	CFLAGS += -DGGML_USE_OPENBLAS -I/usr/local/include/blis -I/usr/include/blis
+	CFLAGS  += -DGGML_USE_OPENBLAS -I/usr/local/include/blis -I/usr/include/blis
 	LDFLAGS += -lblis -L/usr/local/lib
 endif # LLAMA_BLIS
 
@@ -161,6 +169,14 @@ ifdef LLAMA_CUDA_DMMV_Y
 else
 	NVCCFLAGS += -DGGML_CUDA_DMMV_Y=1
 endif # LLAMA_CUDA_DMMV_Y
+ifdef LLAMA_CUDA_DMMV_F16
+	NVCCFLAGS += -DGGML_CUDA_DMMV_F16
+endif # LLAMA_CUDA_DMMV_F16
+ifdef LLAMA_CUDA_KQUANTS_ITER
+	NVCCFLAGS += -DK_QUANTS_PER_ITERATION=$(LLAMA_CUDA_KQUANTS_ITER)
+else
+	NVCCFLAGS += -DK_QUANTS_PER_ITERATION=2
+endif
 ggml-cuda.o: ggml-cuda.cu ggml-cuda.h
 	$(NVCC) $(NVCCFLAGS) $(CXXFLAGS) -Wno-pedantic -c $< -o $@
 endif # LLAMA_CUBLAS
@@ -212,6 +228,11 @@ ifneq ($(filter armv8%,$(UNAME_M)),)
 	CFLAGS += -mfp16-format=ieee -mno-unaligned-access
 endif
 
+ifdef LLAMA_NO_K_QUANTS
+k_quants.o: k_quants.c k_quants.h
+	$(CC) $(CFLAGS) -c $< -o $@
+endif # LLAMA_NO_K_QUANTS
+
 #
 # Print build information
 #
@@ -231,51 +252,54 @@ $(info )
 # Build library
 #
 
-ggml.o: ggml.c ggml.h ggml-cuda.h ggml-quants-k.h
+ggml.o: ggml.c ggml.h ggml-cuda.h
 	$(CC)  $(CFLAGS)   -c $< -o $@
 
-ggml-quants-k.o: ggml-quants-k.c ggml-quants-k.h ggml.h ggml-cuda.h
-	$(CC)  $(CFLAGS)   -c $< -o $@
-
-llama.o: llama.cpp ggml.h ggml-cuda.h llama.h llama-util.h
+llama.o: llama.cpp ggml.h ggml-cuda.h ggml-metal.h llama.h llama-util.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 common.o: examples/common.cpp examples/common.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-libllama.so: llama.o ggml.o ggml-quants-k.o $(OBJS)
+libllama.so: llama.o ggml.o $(OBJS)
 	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -vf *.o main quantize quantize-stats perplexity embedding benchmark-matmult save-load-state server vdot build-info.h
+	rm -vf *.o *.so main quantize quantize-stats perplexity embedding benchmark-matmult save-load-state server vdot train-text-from-scratch build-info.h
 
 #
 # Examples
 #
 
-main: examples/main/main.cpp                                  build-info.h ggml.o ggml-quants-k.o llama.o common.o $(OBJS)
+main: examples/main/main.cpp                                  build-info.h ggml.o llama.o common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 	@echo
 	@echo '====  Run ./main -h for help.  ===='
 	@echo
 
-quantize: examples/quantize/quantize.cpp                      build-info.h ggml.o ggml-quants-k.o llama.o $(OBJS)
+simple: examples/simple/simple.cpp                            build-info.h ggml.o llama.o common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-quantize-stats: examples/quantize-stats/quantize-stats.cpp    build-info.h ggml.o ggml-quants-k.o llama.o $(OBJS)
+quantize: examples/quantize/quantize.cpp                      build-info.h ggml.o llama.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-perplexity: examples/perplexity/perplexity.cpp                build-info.h ggml.o ggml-quants-k.o llama.o common.o $(OBJS)
+quantize-stats: examples/quantize-stats/quantize-stats.cpp    build-info.h ggml.o llama.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-embedding: examples/embedding/embedding.cpp                   build-info.h ggml.o ggml-quants-k.o llama.o common.o $(OBJS)
+perplexity: examples/perplexity/perplexity.cpp                build-info.h ggml.o llama.o common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-save-load-state: examples/save-load-state/save-load-state.cpp build-info.h ggml.o ggml-quants-k.o llama.o common.o $(OBJS)
+embedding: examples/embedding/embedding.cpp                   build-info.h ggml.o llama.o common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-server: examples/server/server.cpp examples/server/httplib.h examples/server/json.hpp build-info.h ggml.o ggml-quants-k.o llama.o common.o $(OBJS)
+save-load-state: examples/save-load-state/save-load-state.cpp build-info.h ggml.o llama.o common.o $(OBJS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+
+server: examples/server/server.cpp examples/server/httplib.h examples/server/json.hpp build-info.h ggml.o llama.o common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) -Iexamples/server $(filter-out %.h,$(filter-out %.hpp,$^)) -o $@ $(LDFLAGS)
+
+train-text-from-scratch: examples/train-text-from-scratch/train-text-from-scratch.cpp    build-info.h ggml.o llama.o $(OBJS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
 build-info.h: $(wildcard .git/index) scripts/build-info.sh
 	@sh scripts/build-info.sh > $@.tmp
@@ -289,11 +313,11 @@ build-info.h: $(wildcard .git/index) scripts/build-info.sh
 # Tests
 #
 
-benchmark-matmult: examples/benchmark/benchmark-matmult.cpp build-info.h ggml.o ggml-quants-k.o $(OBJS)
+benchmark-matmult: examples/benchmark/benchmark-matmult.cpp build-info.h ggml.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 	./$@
 
-vdot: pocs/vdot/vdot.cpp ggml.o ggml-quants-k.o $(OBJS)
+vdot: pocs/vdot/vdot.cpp ggml.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 .PHONY: tests clean
